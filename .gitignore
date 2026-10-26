@@ -1,0 +1,45 @@
+# Maven
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+buildNumber.properties
+
+# Java
+*.class
+*.log
+hs_err_pid*
+replay_pid*
+
+# IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# VS Code
+.vscode/
+
+# Eclipse
+.classpath
+.project
+.settings/
+bin/
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# AWS: nunca subir credenciales ni respuestas locales de invocaciones
+.aws/
+*.pem
+credentials
+response.json
+
+# Variables de entorno
+.env
