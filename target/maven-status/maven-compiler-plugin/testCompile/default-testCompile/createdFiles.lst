@@ -1,2 +1,4 @@
 com\workshop\orders\lambda\LambdaFunctionsTest.class
+com\workshop\orders\http\OrdersHttpHandlerTest.class
+com\workshop\orders\http\OrdersHttpHandlerTest$1.class
 com\workshop\orders\application\OrderServiceTest.class

@@ -1,5 +1,7 @@
 com\workshop\orders\lambda\GetOrderFunction.class
+com\workshop\orders\http\ErrorResponse.class
 com\workshop\orders\lambda\GetOrderInput.class
+com\workshop\orders\http\OrdersHttpHandler.class
 com\workshop\orders\lambda\OrderServiceProvider.class
 com\workshop\orders\application\OrderRepository.class
 com\workshop\orders\domain\CreateOrderRequest.class

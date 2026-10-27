@@ -628,7 +628,181 @@ Lo único que queda en Java es la lógica de negocio y una traducción mínima d
 
 ## 5. Parte V — Lambda proxy integration
 
-_Pendiente._
+En esta arquitectura (**Arquitectura B**), API Gateway **no transforma nada**: entrega a Lambda el request HTTP completo como un evento JSON, y Lambda debe devolver la respuesta HTTP completa (status, headers y body). Toda la lógica HTTP vive en un **adaptador Java** con pruebas unitarias.
+
+### Arquitectura
+
+```mermaid
+flowchart LR
+    C[Cliente HTTP] -->|HTTP| GW
+ 
+    subgraph GW["API Gateway (REST API: orders-api-proxy, stage dev)"]
+        A1["ANY /orders"]
+        A2["ANY /orders/{id}"]
+    end
+ 
+    A1 -->|APIGatewayProxyRequestEvent| H
+    A2 -->|APIGatewayProxyRequestEvent| H
+ 
+    subgraph L["Lambda orders-http"]
+        H["OrdersHttpHandler<br/>(adaptador HTTP)"] --> S["OrderService<br/>(Java puro, sin cambios)"]
+    end
+ 
+    H -->|APIGatewayProxyResponseEvent| GW
+```
+
+### Configuración
+
+**Lambda `orders-http`**
+
+| Configuración | Valor |
+|---|---|
+| Runtime | Java 17 |
+| Rol | `LabRole` |
+| Timeout | 15 s (el cold start ahora carga Jackson y las clases de eventos) |
+| Handler | `com.workshop.orders.http.OrdersHttpHandler::handleRequest` |
+| Artefacto | `target/orders-api-1.0.0.jar` (fat jar generado con `maven-shade-plugin`) |
+
+**API Gateway `orders-api-proxy`**
+
+| Recurso | Método | Integración |
+|---|---|---|
+| `/orders` | `ANY` | Lambda proxy → `orders-http` |
+| `/orders/{id}` | `ANY` | Lambda proxy → `orders-http` |
+
+Eso es **toda** la configuración: no hay mapping templates, method responses, integration responses, regex, modelos ni gateway responses.
+
+**¿Por qué `ANY`?** Porque el enrutamiento por método HTTP vive en Java (`OrdersHttpHandler.route()`). Declarar `GET` y `POST` por separado en API Gateway duplicaría esa decisión en dos lugares. Con `ANY`, API Gateway solo conoce los recursos, y un método no soportado lo responde Java con **405 Method Not Allowed**.
+
+### El evento de API Gateway
+
+Se guardaron dos eventos reales capturados desde la consola de API Gateway (con los datos de la cuenta reemplazados por valores de ejemplo):
+
+- [`events/apigw-proxy-event-get-order.json`](events/apigw-proxy-event-get-order.json)
+- [`events/apigw-proxy-event-post-order.json`](events/apigw-proxy-event-post-order.json)
+  Dónde aparece cada dato:
+
+| Dato | Campo del evento | Ejemplo |
+|---|---|---|
+| Método HTTP | `httpMethod` | `"GET"` |
+| Path real | `path` | `"/orders/ORD-001"` |
+| Path como plantilla | `resource` | `"/orders/{id}"` |
+| Path parameters | `pathParameters` | `{"id": "ORD-001"}` |
+| Query parameters | `queryStringParameters` (y `multiValueQueryStringParameters`) | `{"customerId": "CUST-42"}` |
+| Headers | `headers` (y `multiValueHeaders`) | `{"Content-Type": "application/json"}` |
+| Body | `body` | `"{ \"customerId\": \"CUST-42\", ... }"` |
+| Metadatos | `requestContext` | stage, requestId, identidad del llamante, etc. |
+
+Observaciones:
+
+- **El `body` llega como string**, no como objeto JSON. API Gateway no lo interpreta, así que el adaptador debe deserializarlo con `JSON.readValue(body, CreateOrderRequest.class)`.
+- **`path` vs `resource`.** El adaptador enruta con `resource` (`/orders/{id}`) y obtiene el id de `pathParameters`, sin parsear la URL a mano.
+- **Los parámetros ausentes llegan como `null`**, no como mapas vacíos. Por ejemplo, `queryStringParameters` es `null` cuando no hay query string. El adaptador lo contempla en `param()`.
+- **El evento contiene datos de identidad** del llamante (`accountId`, `userArn`, `accessKey`). Por eso se reemplazaron antes de guardarlos en el repositorio.
+### El adaptador HTTP
+
+`OrdersHttpHandler` (paquete `com.workshop.orders.http`) es la **única** clase que conoce HTTP. `OrderService`, `Order` y las excepciones de dominio no cambiaron.
+
+| Responsabilidad | Arquitectura A (API Gateway) | Arquitectura B (adaptador Java) |
+|---|---|---|
+| Enrutamiento | Un método y una Lambda por operación | `route()` según `httpMethod` + `resource` |
+| Extraer `{id}` | `$input.params('id')` en VTL | `event.getPathParameters().get("id")` |
+| Extraer `customerId` | `$input.params('customerId')` en VTL | `event.getQueryStringParameters().get("customerId")` |
+| Parsear el body | Runtime de Lambda | Jackson, en el adaptador |
+| JSON inválido | Modelo + validador + gateway response | `catch (JsonProcessingException)` → 400 |
+| 404 / 400 | Regex sobre el texto de `errorMessage` | `catch` por **tipo** de excepción |
+| Error inesperado | Regex `INTERNAL_ERROR:.*` (si alguien la configuró) | `catch (Exception)` → siempre 500, sin detalles |
+| Header `Location` | `$context.responseOverride` en VTL | `headers.put("Location", "/orders/" + id)` |
+| Método no soportado | No contemplado | 405 `METHOD_NOT_ALLOWED` |
+
+Ya no son necesarios los prefijos de texto (`ORDER_NOT_FOUND: ...`): el status code depende del **tipo** de la excepción, y eso lo verifica el compilador.
+
+El adaptador recibe el `OrderService` por constructor. Lambda usa el constructor vacío (con el repositorio precargado) y los tests inyectan uno controlado.
+
+### Pruebas unitarias del adaptador
+
+`OrdersHttpHandlerTest` construye eventos `APIGatewayProxyRequestEvent` iguales a los que envía API Gateway y verifica la respuesta HTTP, **sin AWS**:
+
+| Test | Verifica |
+|---|---|
+| `getExistingOrderReturns200` | 200 + `Content-Type: application/json` |
+| `getMissingOrderReturns404WithErrorFormat` | 404 con el body exacto del contrato |
+| `searchByCustomerReturns200` | 200 con una lista |
+| `searchWithoutQueryStringReturns400` | 400 cuando `queryStringParameters` es `null` |
+| `postValidOrderReturns201WithLocation` | 201 + `Location: /orders/ORD-004` |
+| `createdOrderCanBeRetrievedAfterwards` | Una orden creada se puede consultar después |
+| `postWithZeroQuantityReturns400` | 400 con el mensaje de la regla de negocio |
+| `postWithTextQuantityReturns400` | 400 cuando un campo tiene tipo incorrecto |
+| `postWithMalformedJsonReturns400` | 400 con JSON de sintaxis inválida |
+| `postWithoutBodyReturns400` | 400 sin body |
+| `unsupportedMethodReturns405` | 405 para métodos no soportados |
+| `unexpectedErrorReturns500WithoutInternalDetails` | 500 genérico, sin filtrar el mensaje interno de la excepción |
+
+Varios de estos tests cubren exactamente los problemas que en la Arquitectura A solo se descubrieron probando manualmente en AWS (hallazgos 1, 3 y 5).
+
+Resultado de `mvn clean package`: **27 tests, 0 fallos**.
+
+### Pruebas con curl
+
+```powershell
+$API2 = "https://plj90flkd8.execute-api.us-east-1.amazonaws.com/dev"
+```
+
+| Request | Status | Body |
+|---|---|---|
+| `GET /orders/ORD-001` | **200 OK** | `{"id":"ORD-001","customerId":"CUST-42","product":"MacBook Air","quantity":1}` |
+| `GET /orders/ORD-999` | **404 Not Found** | `{"error":"ORDER_NOT_FOUND","message":"Order ORD-999 does not exist"}` |
+| `GET /orders?customerId=CUST-42` | **200 OK** | `[{"id":"ORD-001",...},{"id":"ORD-002",...}]` |
+| `GET /orders` | **400 Bad Request** | `{"error":"INVALID_REQUEST","message":"customerId is required"}` |
+| `POST /orders` (válido) | **201 Created** + `Location: /orders/ORD-004` | `{"id":"ORD-004","customerId":"CUST-42","product":"MacBook Air","quantity":1}` |
+| `POST /orders` (`quantity: 0`) | **400 Bad Request** | `{"error":"INVALID_REQUEST","message":"quantity must be greater than 0"}` |
+| `POST /orders` (`quantity: "dos"`) | **400 Bad Request** | `{"error":"INVALID_REQUEST","message":"Request body is not valid JSON or has invalid field types"}` |
+| `PUT /orders/ORD-001` | **405 Method Not Allowed** | `{"error":"METHOD_NOT_ALLOWED","message":"PUT /orders/{id} is not supported"}` |
+| `GET /orders/ORD-004` (recién creada) | **200 OK** | `{"id":"ORD-004","customerId":"CUST-42","product":"MacBook Air","quantity":1}` |
+
+Comandos:
+```powershell
+curl.exe -i "$API2/orders/ORD-001"
+curl.exe -i "$API2/orders/ORD-999"
+curl.exe -i "$API2/orders?customerId=CUST-42"
+curl.exe -i "$API2/orders"
+curl.exe -i -X POST "$API2/orders" -H "Content-Type: application/json" --data-binary "@requests/create-order.json"
+curl.exe -i -X POST "$API2/orders" -H "Content-Type: application/json" --data-binary "@requests/create-order-invalid-quantity.json"
+curl.exe -i -X POST "$API2/orders" -H "Content-Type: application/json" --data-binary "@requests/create-order-text-quantity.json"
+curl.exe -i -X PUT "$API2/orders/ORD-001"
+curl.exe -i "$API2/orders/ORD-004"
+```
+
+#### Evidencias
+
+`GET /orders/{id}` a través de la integración proxy: API Gateway entrega el request sin transformarlo y el adaptador responde 200:
+
+![GET /orders/{id} con proxy](imgs/evd13_testhttpproxy_get_orders_id.png)
+
+`POST /orders/{id}`: la combinación no existe en el contrato, y el adaptador Java responde **405 Method Not Allowed** (el enrutamiento por método vive en Java gracias a `ANY`):
+
+![POST /orders/{id} devuelve 405](imgs/evd14_testhttpproxy_post_orders_id_405.png)
+
+### Observaciones
+
+**1. Todo funcionó en el primer despliegue.** Los casos que en la Arquitectura A requirieron varias rondas de corrección en la consola (tipo de dato inválido, query string ausente, error inesperado) ya estaban cubiertos por los tests antes de desplegar.
+
+**2. Crear y luego consultar ahora funciona (201 → 200).** En la Arquitectura A, `POST` y `GET` corrían en Lambdas distintas con memorias separadas, y el mismo escenario daba **201 → 404**. Aquí las tres operaciones comparten la misma Lambda y, por lo tanto, el mismo repositorio en memoria.
+
+> ⚠️ Esto **no** convierte la memoria en persistencia. Funciona porque las llamadas fueron secuenciales y las atendió el mismo entorno caliente. Con tráfico concurrente, Lambda crearía varios entornos, cada uno con su propia memoria, y el problema volvería a aparecer. Cuando AWS recicle el entorno, las órdenes creadas se perderán. Un almacenamiento compartido (por ejemplo DynamoDB) sigue siendo necesario.
+
+**3. El JAR y el cold start crecieron.**
+
+| | Arquitectura A (`orders-create`) | Arquitectura B (`orders-http`) |
+|---|---|---|
+| Tamaño del JAR | 19 KB (solo nuestras clases) | **3.4 MB** (+ AWS events + Jackson) |
+| Billed duration en cold start | 348 ms | **1190 ms** |
+| Memoria usada | 92 MB | **107 MB** |
+| Timeout necesario | 3 s (por defecto) | Se subió a 15 s por precaución |
+
+Este es el costo de mover la lógica HTTP a Java. La respuesta del Checkpoint 1 ("el JAR solo contiene nuestras clases") ya no es válida: ahora el JAR incluye dependencias de AWS.
+
+**4. La serialización JSON pasó a ser responsabilidad nuestra.** En la Parte II, el runtime de Lambda convertía JSON ↔ Java automáticamente. Ahora la Lambda devuelve un `body` **string** que nosotros generamos con Jackson. Esto nos da control total (por ejemplo, decidimos ignorar campos desconocidos con `FAIL_ON_UNKNOWN_PROPERTIES = false`), pero también nos obliga a manejar los errores de parseo.
 
 ## 6. Comparación de arquitecturas
 

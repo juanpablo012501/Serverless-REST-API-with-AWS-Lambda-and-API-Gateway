@@ -5,6 +5,8 @@ F:\tdse\orders-api\src\main\java\com\workshop\orders\domain\CreateOrderRequest.j
 F:\tdse\orders-api\src\main\java\com\workshop\orders\domain\InvalidOrderException.java
 F:\tdse\orders-api\src\main\java\com\workshop\orders\domain\Order.java
 F:\tdse\orders-api\src\main\java\com\workshop\orders\domain\OrderNotFoundException.java
+F:\tdse\orders-api\src\main\java\com\workshop\orders\http\ErrorResponse.java
+F:\tdse\orders-api\src\main\java\com\workshop\orders\http\OrdersHttpHandler.java
 F:\tdse\orders-api\src\main\java\com\workshop\orders\lambda\CreateOrderFunction.java
 F:\tdse\orders-api\src\main\java\com\workshop\orders\lambda\GetOrderFunction.java
 F:\tdse\orders-api\src\main\java\com\workshop\orders\lambda\GetOrderInput.java
