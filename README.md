@@ -1176,6 +1176,8 @@ Invoke URL: `https://plj90flkd8.execute-api.us-east-1.amazonaws.com/dev`
  
 ---
 
+**Video de demostración:** [ver video](https://youtu.be/YfZcgM1bWco)
+
 ## 10. Cómo compilar y probar
 
 ### Requisitos
