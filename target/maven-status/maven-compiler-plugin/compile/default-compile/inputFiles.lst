@@ -5,3 +5,4 @@ F:\tdse\orders-api\src\main\java\com\workshop\orders\domain\CreateOrderRequest.j
 F:\tdse\orders-api\src\main\java\com\workshop\orders\domain\InvalidOrderException.java
 F:\tdse\orders-api\src\main\java\com\workshop\orders\domain\Order.java
 F:\tdse\orders-api\src\main\java\com\workshop\orders\domain\OrderNotFoundException.java
+F:\tdse\orders-api\src\main\java\com\workshop\orders\lambda\CreateOrderFunction.java

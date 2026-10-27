@@ -187,7 +187,143 @@ Ninguna. En este punto no existe ningún concepto de request, response, header n
 
 ## 3. Parte II — Despliegue en AWS Lambda
 
-_Pendiente._
+### Función desplegada
+
+Se desplegó la operación **crear orden** como la función Lambda `orders-create`.
+
+| Configuración | Valor |
+|---|---|
+| Runtime | Java 17 |
+| Arquitectura | x86_64 |
+| Rol de ejecución | `LabRole` |
+| Artefacto | `target/orders-api-1.0.0.jar` |
+| Handler | `com.workshop.orders.lambda.CreateOrderFunction::handleRequest` |
+
+No fue necesario rediseñar la aplicación. Se agregó una única clase de entrada, `CreateOrderFunction`, que construye el `OrderService` y le delega la operación:
+
+```java
+public class CreateOrderFunction {
+ 
+    private static final OrderService SERVICE =
+            new OrderService(InMemoryOrderRepository.withSampleData());
+ 
+    public Order handleRequest(CreateOrderRequest request) {
+        return SERVICE.createOrder(request);
+    }
+}
+```
+
+Esta clase **no depende de ninguna librería de AWS**: recibe un `CreateOrderRequest` y devuelve un `Order`. Existe solo porque el runtime de Lambda necesita instanciar la clase del handler con un constructor vacío, y `OrderService` recibe su repositorio por constructor. El JAR sigue sin dependencias externas, por lo que se sube tal cual.
+
+### Invocaciones manuales
+
+#### 1. Orden válida
+
+**Request**
+```json
+{ "customerId": "CUST-42", "product": "MacBook Air", "quantity": 1 }
+```
+
+**Response**
+```json
+{ "id": "ORD-004", "customerId": "CUST-42", "product": "MacBook Air", "quantity": 1 }
+```
+
+El id es `ORD-004` porque el repositorio arranca con tres órdenes precargadas. Esta primera invocación mostró `Init duration: 308.90 ms`, que corresponde al *cold start*: el tiempo que tarda AWS en crear el entorno de ejecución y cargar la clase.
+
+![Invocación exitosa](imgs/evd00_testvalido.png)
+
+#### 2. Invocaciones repetidas: el id se incrementa
+
+Al repetir la misma invocación, el id avanza (`ORD-005`, `ORD-006`, …) y ya no aparece `Init duration`.
+
+![El id se incrementa entre invocaciones](imgs/evd01_testvalido_idincrementa.png)
+
+Esto demuestra que, mientras el entorno está "caliente", Lambda **reutiliza** la misma instancia y por lo tanto los campos `static` (el `OrderService` y su repositorio en memoria) sobreviven entre invocaciones. Cuando AWS recicla el entorno, el estado se pierde y el contador vuelve a empezar. La memoria de Lambda sirve como caché, **no como almacenamiento persistente**.
+
+#### 3. Otro cliente
+
+**Request**
+```json
+{ "customerId": "CUST-100", "product": "Monitor", "quantity": 3 }
+```
+
+Respuesta exitosa con una nueva orden para `CUST-100`.
+
+![Orden para otro cliente](imgs/evd02_otrocliente.png)
+
+#### 4. Cantidad en cero → falla en la lógica de negocio
+
+**Request**
+```json
+{ "customerId": "CUST-42", "product": "Mouse", "quantity": 0 }
+```
+
+La invocación **falla**. El JSON se convirtió correctamente a `CreateOrderRequest` y el código llegó a `OrderService`, que lanzó `InvalidOrderException`. El runtime transformó la excepción en un JSON de error con `errorMessage` (`quantity must be greater than 0`), `errorType` (`com.workshop.orders.domain.InvalidOrderException`) y `stackTrace`.
+
+![Cantidad cero](imgs/evd03_cantidadcero.png)
+
+#### 5. Cantidad como texto → falla en el runtime, antes de llegar al código
+
+**Request**
+```json
+{ "customerId": "CUST-42", "product": "Mouse", "quantity": "dos" }
+```
+
+La invocación **falla**, pero por una razón distinta: el runtime no pudo convertir `"dos"` en un `Integer` al deserializar el JSON. El error se produjo **antes** de ejecutar `handleRequest`, así que ninguna línea de la aplicación se ejecutó. Es un error de formato del mensaje, no de una regla de negocio.
+
+![Cantidad como texto](imgs/evd04_cantidadtexto.png)
+
+#### 6. Campo desconocido → se ignora
+
+**Request**
+```json
+{ "customerId": "CUST-42", "product": "Mouse", "quantity": 1, "color": "rojo" }
+```
+
+La invocación **tiene éxito**. `CreateOrderRequest` no tiene un campo `color`, y el serializador del runtime simplemente lo ignoró.
+
+![Campo extra ignorado](imgs/evd05_campoextra.png)
+
+### Investigación: ¿cómo convierte el runtime de Lambda JSON ↔ Java?
+
+**Explicación propuesta (con ayuda del LLM):**
+
+1. Al crear el entorno, el runtime lee el handler configurado (`Clase::metodo`), carga la clase desde el JAR y la instancia con su **constructor vacío**.
+2. Por **reflexión**, inspecciona el tipo del parámetro del método (`CreateOrderRequest`).
+3. Usa un serializador JSON interno, basado en Jackson, para crear ese objeto: instancia la clase con el constructor vacío y asigna cada campo del JSON mediante el **setter** del mismo nombre.
+4. Ejecuta el método.
+5. Serializa el valor de retorno (`Order`) a JSON usando sus **getters**.
+6. Si el método lanza una excepción, la convierte en un JSON con `errorMessage`, `errorType` y `stackTrace`, y marca la invocación como fallida.
+7. Además de POJOs, el método puede recibir `String`, `Map` o un `InputStream` crudo (implementando `RequestStreamHandler`) cuando se quiere controlar la serialización manualmente.
+   **Verificación contra el comportamiento observado:**
+
+| Afirmación | Evidencia | ¿Se cumple? |
+|---|---|---|
+| JSON → POJO por nombre de campo | Prueba 1: los tres campos llegaron correctamente a `CreateOrderRequest` | ✅ |
+| POJO → JSON con getters | Prueba 1: la respuesta contiene `id`, `customerId`, `product`, `quantity` | ✅ |
+| La instancia se reutiliza entre invocaciones calientes | Prueba 2: el id se incrementa y desaparece el `Init duration` | ✅ |
+| Las excepciones de la aplicación se convierten en JSON de error | Prueba 4: `errorType` es nuestra `InvalidOrderException` | ✅ |
+| Un JSON incompatible con el tipo falla antes de ejecutar el código | Prueba 5: el error viene del parseo, no de `OrderService` | ✅ |
+| Las propiedades desconocidas se ignoran | Prueba 6: `color` no produjo error | ✅ |
+
+**Conclusión:** la conversión JSON ↔ Java es responsabilidad del **runtime de Lambda**, no de nuestro código. Por eso la aplicación puede trabajar solo con objetos de dominio. La contrapartida es que perdemos control sobre los errores de formato (prueba 5) y que todas las fallas se reportan con el mismo formato genérico de Lambda, no con el formato de error que diseñamos para la API. Ese problema se resolverá cuando agreguemos la capa HTTP.
+
+### Checkpoint 2 — Diagrama de la solución
+
+```mermaid
+flowchart TD
+    A["JSON de entrada<br/>{customerId, product, quantity}"] --> B["AWS Lambda Java Runtime<br/>deserializa con Jackson"]
+    B --> C["CreateOrderRequest<br/>(POJO)"]
+    C --> D["CreateOrderFunction.handleRequest<br/>clase de entrada, sin dependencias de AWS"]
+    D --> E["OrderService.createOrder<br/>lógica de negocio, Java puro"]
+    E --> F["Order<br/>(POJO)"]
+    F --> G["AWS Lambda Java Runtime<br/>serializa con getters"]
+    G --> H["JSON de salida<br/>{id, customerId, product, quantity}"]
+ 
+    E -. "InvalidOrderException" .-> X["Runtime: JSON de error<br/>{errorMessage, errorType, stackTrace}"]
+    B -. "JSON incompatible con el tipo" .-> X
+```
 
 ## 4. Parte III y IV — API Gateway con mapping templates
 
@@ -225,3 +361,4 @@ _Pendiente._
 mvn test      # ejecuta las pruebas unitarias
 mvn package   # genera target/orders-api-1.0.0.jar
 ```
+ 

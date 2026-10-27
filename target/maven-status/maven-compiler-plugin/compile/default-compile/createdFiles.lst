@@ -3,5 +3,6 @@ com\workshop\orders\domain\InvalidOrderException.class
 com\workshop\orders\domain\OrderNotFoundException.class
 com\workshop\orders\application\OrderRepository.class
 com\workshop\orders\domain\CreateOrderRequest.class
+com\workshop\orders\lambda\CreateOrderFunction.class
 com\workshop\orders\application\InMemoryOrderRepository.class
 com\workshop\orders\application\OrderService.class
