@@ -235,7 +235,7 @@ El id es `ORD-004` porque el repositorio arranca con tres órdenes precargadas. 
 
 #### 2. Invocaciones repetidas: el id se incrementa
 
-Al repetir la misma invocación, el id avanza (`ORD-005`, `ORD-006`, …) y ya no aparece `Init duration`.
+Al repetir la misma invocación, el id avanza (`ORD-005`, `ORD-006`, …) y ya no aparece `Init duration`. Además, la duración cae de **38.66 ms** en la primera invocación a **1.71 ms** en una invocación caliente.
 
 ![El id se incrementa entre invocaciones](imgs/evd01_testvalido_idincrementa.png)
 
@@ -259,7 +259,22 @@ Respuesta exitosa con una nueva orden para `CUST-100`.
 { "customerId": "CUST-42", "product": "Mouse", "quantity": 0 }
 ```
 
-La invocación **falla**. El JSON se convirtió correctamente a `CreateOrderRequest` y el código llegó a `OrderService`, que lanzó `InvalidOrderException`. El runtime transformó la excepción en un JSON de error con `errorMessage` (`quantity must be greater than 0`), `errorType` (`com.workshop.orders.domain.InvalidOrderException`) y `stackTrace`.
+La invocación **falla**. El JSON se convirtió correctamente a `CreateOrderRequest` y el código llegó a `OrderService`, que lanzó `InvalidOrderException`. El runtime transformó la excepción en este JSON:
+
+```json
+{
+  "errorMessage": "quantity must be greater than 0",
+  "errorType": "com.workshop.orders.domain.InvalidOrderException",
+  "stackTrace": [
+    "com.workshop.orders.application.OrderService.validate(OrderService.java:50)",
+    "com.workshop.orders.application.OrderService.createOrder(OrderService.java:15)",
+    "com.workshop.orders.lambda.CreateOrderFunction.handleRequest(CreateOrderFunction.java:15)",
+    "..."
+  ]
+}
+```
+
+El `stackTrace` muestra la ruta completa a través de **nuestro** código: `CreateOrderFunction` → `OrderService.createOrder` → `OrderService.validate`.
 
 ![Cantidad cero](imgs/evd03_cantidadcero.png)
 
@@ -270,9 +285,32 @@ La invocación **falla**. El JSON se convirtió correctamente a `CreateOrderRequ
 { "customerId": "CUST-42", "product": "Mouse", "quantity": "dos" }
 ```
 
-La invocación **falla**, pero por una razón distinta: el runtime no pudo convertir `"dos"` en un `Integer` al deserializar el JSON. El error se produjo **antes** de ejecutar `handleRequest`, así que ninguna línea de la aplicación se ejecutó. Es un error de formato del mensaje, no de una regla de negocio.
+La invocación **falla**, pero por una razón distinta. La respuesta fue:
 
-![Cantidad como texto](imgs/evd04_cantidadtexto.png)
+```json
+{
+  "errorMessage": "An error occurred during JSON parsing",
+  "errorType": "java.lang.RuntimeException",
+  "stackTrace": []
+}
+```
+
+Y en el log de CloudWatch aparece la causa real:
+
+```
+Caused by: com.amazonaws.lambda.thirdparty.com.fasterxml.jackson.databind.exc.InvalidFormatException:
+Cannot deserialize value of type `java.lang.Integer` from String "dos": not a valid `java.lang.Integer` value
+ (through reference chain: com.workshop.orders.domain.CreateOrderRequest["quantity"])
+    at com.amazonaws.services.lambda.runtime.serialization.factories.JacksonFactory$InternalSerializer.fromJson(...)
+```
+
+Observaciones:
+
+- El `stackTrace` de la respuesta está **vacío** y no aparece ninguna clase de nuestro paquete: el error ocurrió **antes** de ejecutar `handleRequest`. Ninguna línea de la aplicación se ejecutó.
+- El `errorType` es un genérico `java.lang.RuntimeException`, no una excepción nuestra. El cliente no puede saber qué campo estaba mal sin revisar los logs.
+- La causa revela la librería que usa el runtime: **Jackson**, empaquetado internamente por AWS (`com.amazonaws.lambda.thirdparty.com.fasterxml.jackson`), invocado desde `JacksonFactory`.
+- Es un error de **formato** del mensaje, no de una regla de negocio.
+  ![Cantidad como texto](imgs/evd04_cantidadtexto.png)
 
 #### 6. Campo desconocido → se ignora
 
@@ -281,7 +319,7 @@ La invocación **falla**, pero por una razón distinta: el runtime no pudo conve
 { "customerId": "CUST-42", "product": "Mouse", "quantity": 1, "color": "rojo" }
 ```
 
-La invocación **tiene éxito**. `CreateOrderRequest` no tiene un campo `color`, y el serializador del runtime simplemente lo ignoró.
+La invocación **tiene éxito** y devuelve `ORD-008` sin el campo `color`. `CreateOrderRequest` no tiene ese campo, y el serializador del runtime simplemente lo ignoró.
 
 ![Campo extra ignorado](imgs/evd05_campoextra.png)
 
@@ -300,7 +338,8 @@ La invocación **tiene éxito**. `CreateOrderRequest` no tiene un campo `color`,
 
 | Afirmación | Evidencia | ¿Se cumple? |
 |---|---|---|
-| JSON → POJO por nombre de campo | Prueba 1: los tres campos llegaron correctamente a `CreateOrderRequest` | ✅ |
+| El serializador interno está basado en Jackson | Prueba 5: el log muestra `com.amazonaws.lambda.thirdparty.com.fasterxml.jackson` y `JacksonFactory` | ✅ |
+| JSON → POJO por nombre de campo | Prueba 1: los tres campos llegaron correctamente a `CreateOrderRequest`; prueba 5: el error referencia `CreateOrderRequest["quantity"]` | ✅ |
 | POJO → JSON con getters | Prueba 1: la respuesta contiene `id`, `customerId`, `product`, `quantity` | ✅ |
 | La instancia se reutiliza entre invocaciones calientes | Prueba 2: el id se incrementa y desaparece el `Init duration` | ✅ |
 | Las excepciones de la aplicación se convierten en JSON de error | Prueba 4: `errorType` es nuestra `InvalidOrderException` | ✅ |
@@ -327,7 +366,265 @@ flowchart TD
 
 ## 4. Parte III y IV — API Gateway con mapping templates
 
-_Pendiente._
+En esta arquitectura (**Arquitectura A**), API Gateway usa **integración Lambda no-proxy**: transforma cada request HTTP en el JSON exacto que espera cada función Java y transforma cada respuesta (o error) de Lambda en una respuesta HTTP.
+
+### Arquitectura
+
+```mermaid
+flowchart LR
+    C[Cliente HTTP] -->|HTTP| GW
+ 
+    subgraph GW["API Gateway (REST API: orders-api-mapping, stage dev)"]
+        R1["POST /orders<br/>validador de body + template"]
+        R2["GET /orders/{id}<br/>template: path → {id}"]
+        R3["GET /orders?customerId<br/>template: query → {customerId}"]
+    end
+ 
+    R1 --> L1["Lambda orders-create<br/>CreateOrderFunction"]
+    R2 --> L2["Lambda orders-get<br/>GetOrderFunction"]
+    R3 --> L3["Lambda orders-search<br/>SearchOrdersFunction"]
+ 
+    L1 --> S["OrderService<br/>(Java puro)"]
+    L2 --> S
+    L3 --> S
+```
+
+### Decisiones de diseño
+
+**Una Lambda por operación.** Las tres funciones usan el mismo JAR con distinto handler. Así, el enrutamiento queda completamente en API Gateway, que es la idea de esta arquitectura.
+
+| Función | Handler | Recurso |
+|---|---|---|
+| `orders-create` | `com.workshop.orders.lambda.CreateOrderFunction::handleRequest` | `POST /orders` |
+| `orders-get` | `com.workshop.orders.lambda.GetOrderFunction::handleRequest` | `GET /orders/{id}` |
+| `orders-search` | `com.workshop.orders.lambda.SearchOrdersFunction::handleRequest` | `GET /orders?customerId=` |
+
+**Traducción de errores con prefijos estables.** En integración no-proxy, API Gateway solo puede elegir el status code comparando el `errorMessage` de Lambda contra expresiones regulares. Para no depender de frases en inglés, la capa `lambda` traduce las excepciones de dominio a mensajes con un prefijo:
+
+| Excepción de dominio | `errorMessage` | Regex en API Gateway | Status |
+|---|---|---|---|
+| `OrderNotFoundException` | `ORDER_NOT_FOUND: Order ORD-999 does not exist` | `ORDER_NOT_FOUND:.*` | 404 |
+| `InvalidOrderException` | `INVALID_REQUEST: quantity must be greater than 0` | `INVALID_REQUEST:.*` | 400 |
+| Cualquier otra | `INTERNAL_ERROR: Unexpected error` | `INTERNAL_ERROR:.*` | 500 |
+
+El dominio sigue sin conocer HTTP: la traducción está en `LambdaErrors` (paquete `lambda`) y la decisión del status code la toma API Gateway. Esta traducción tiene pruebas unitarias en `LambdaFunctionsTest`, que se ejecutan sin AWS.
+
+**Validación dividida entre formato y negocio.**
+- **API Gateway** valida el **formato** del body de `POST /orders` con un modelo JSON Schema (`CreateOrderRequest`) y el validador `Validate body`: que `quantity` sea entero y que los textos sean texto.
+- **`OrderService`** valida las **reglas de negocio**: campos obligatorios no vacíos y `quantity ≥ 1`.
+  Cada regla vive en un solo lugar.
+
+### Configuración de API Gateway
+
+#### `GET /orders/{id}`
+
+**Integration request** — mapping template (`application/json`):
+```
+{
+  "id": "$util.escapeJavaScript($input.params('id'))"
+}
+```
+
+**Integration responses:**
+
+| Regex | Status |
+|---|---|
+| _(default)_ | 200 |
+| `ORDER_NOT_FOUND:.*` | 404 |
+| `INVALID_REQUEST:.*` | 400 |
+| `INTERNAL_ERROR:.*` | 500 |
+
+Plantilla de error (cambiando `"error"` según el caso):
+```
+#set($full = $input.path('$.errorMessage'))
+#set($start = $full.indexOf(': ') + 2)
+{
+  "error": "ORDER_NOT_FOUND",
+  "message": "$util.escapeJavaScript($full.substring($start))"
+}
+```
+
+#### `GET /orders?customerId={customerId}`
+
+**Method request:** query string `customerId` (no requerido; la validación la hace `OrderService`).
+
+**Integration request** — mapping template:
+```
+{
+  "customerId": "$util.escapeJavaScript($input.params('customerId'))"
+}
+```
+
+**Integration responses:** default → 200, `INVALID_REQUEST:.*` → 400, `INTERNAL_ERROR:.*` → 500 (misma plantilla de error).
+
+#### `POST /orders`
+
+**Model `CreateOrderRequest`:**
+```json
+{
+  "$schema": "http://json-schema.org/draft-04/schema#",
+  "title": "CreateOrderRequest",
+  "type": "object",
+  "properties": {
+    "customerId": { "type": "string" },
+    "product":    { "type": "string" },
+    "quantity":   { "type": "integer", "maximum": 2147483647 }
+  }
+}
+```
+
+**Method request:** validador `Validate body` con el modelo `CreateOrderRequest`.
+
+**Integration request** — mapping template:
+```
+$input.json('$')
+```
+
+**Integration response por defecto → 201**, con el header `Location` construido en VTL:
+```
+#set($id = $input.path('$.id'))
+#set($context.responseOverride.header.Location = "/orders/$id")
+$input.json('$')
+```
+
+**Integration responses de error:** `INVALID_REQUEST:.*` → 400, `INTERNAL_ERROR:.*` → 500.
+
+**Gateway response `Bad Request Body`** (cuando falla el validador):
+```
+{
+  "error": "INVALID_REQUEST",
+  "message": "$util.escapeJavaScript($context.error.validationErrorString)"
+}
+```
+
+### Pruebas con curl
+
+```powershell
+$API = "https://yafdh47yu9.execute-api.us-east-1.amazonaws.com/dev"
+```
+
+| Request | Status | Body |
+|---|---|---|
+| `GET /orders/ORD-001` | **200 OK** | `{"id":"ORD-001","customerId":"CUST-42","product":"MacBook Air","quantity":1}` |
+| `GET /orders/ORD-999` | **404 Not Found** | `{"error":"ORDER_NOT_FOUND","message":"Order ORD-999 does not exist"}` |
+| `GET /orders?customerId=CUST-42` | **200 OK** | `[{"id":"ORD-001",...},{"id":"ORD-002",...}]` |
+| `GET /orders?customerId=CUST-100` | **200 OK** | `[]` |
+| `GET /orders` | **400 Bad Request** | `{"error":"INVALID_REQUEST","message":"customerId is required"}` |
+| `POST /orders` (válido) | **201 Created** + `Location: /orders/ORD-004` | `{"id":"ORD-004","customerId":"CUST-42","product":"MacBook Air","quantity":1}` |
+| `POST /orders` (`quantity: 0`) | **400 Bad Request** | `{"error":"INVALID_REQUEST","message":"quantity must be greater than 0"}` |
+| `POST /orders` (`quantity: "dos"`) | **400 Bad Request** | `{"error":"INVALID_REQUEST","message":"([instance type (string) does not match any allowed primitive type (allowed: [\"integer\"])])"}` |
+| `GET /orders/ORD-004` (recién creada) | **404 Not Found** | `{"error":"ORDER_NOT_FOUND","message":"Order ORD-004 does not exist"}` |
+
+Los bodies de los POST están en la carpeta [`requests/`](requests/).
+
+#### Evidencias
+
+`GET /orders/{id}` — orden existente (200):
+
+![GET orden existente](imgs/evd06_pruebagetvalida.png)
+
+`GET /orders/{id}` — orden inexistente (404):
+
+![GET orden inexistente](imgs/evd07_ordernotfound.png)
+
+Mapping de respuesta — caso válido:
+
+![Response mapping válido](imgs/evd08_responsemappingvalida.png)
+
+Mapping de respuesta — `ORDER_NOT_FOUND` convertido al formato de error del contrato:
+
+![Response mapping 404](imgs/evd09_responsemapping_ordernotfound.png)
+
+`POST /orders` con `"quantity": "dos"` **antes** de la corrección: 201 con el error crudo de Lambda (ver hallazgo 1):
+
+![POST con error de parseo devolviendo 201](imgs/evd10_posttest_jsonparsingerror.png)
+
+`POST /orders` con `"quantity": "dos"` **después** de agregar el validador de modelo: 400 en 4 ms, sin invocar Lambda:
+
+![POST con tipo incorrecto corregido](imgs/evd11_posttest_parsingerrorcorrected_ej_tipoincorrecto.png)
+
+`GET /orders` sin `customerId` **después** de agregar el mapeo de errores al método: 400 con el formato del contrato, sin exponer el stack trace (ver hallazgo 3):
+
+![GET sin customerId devolviendo 400](imgs/evd12_get_sin_customerid_400.png)
+
+Comandos:
+```powershell
+curl.exe -i "$API/orders/ORD-001"
+curl.exe -i "$API/orders/ORD-999"
+curl.exe -i "$API/orders?customerId=CUST-42"
+curl.exe -i "$API/orders?customerId=CUST-100"
+curl.exe -i "$API/orders"
+curl.exe -i -X POST "$API/orders" -H "Content-Type: application/json" --data-binary "@requests/create-order.json"
+curl.exe -i -X POST "$API/orders" -H "Content-Type: application/json" --data-binary "@requests/create-order-invalid-quantity.json"
+curl.exe -i -X POST "$API/orders" -H "Content-Type: application/json" --data-binary "@requests/create-order-text-quantity.json"
+curl.exe -i "$API/orders/ORD-004"
+```
+
+### Hallazgos durante la implementación
+
+**1. Un error sin regex que coincida se convierte en un éxito.**
+Antes de configurar el validador, `POST /orders` con `"quantity": "dos"` respondió **201 Created** con este body:
+```json
+{"errorMessage":"An error occurred during JSON parsing","errorType":"java.lang.RuntimeException","stackTrace":[]}
+```
+El runtime de Lambda falló al deserializar el body, **antes** de ejecutar nuestro código, así que el mensaje no tenía prefijo. Ninguna regex coincidió y API Gateway usó la respuesta por defecto (201). Incluso ejecutó la plantilla del `Location` sobre el error, y produjo el header roto `Location: /orders/`. Los logs de API Gateway lo confirmaron:
+```
+Endpoint response headers: {... X-Amz-Function-Error=Unhandled ...}
+Endpoint response body before transformations: {"errorMessage":"An error occurred during JSON parsing",...}
+Response header overrides: Add Location: /orders/
+Method completed with status: 201
+```
+
+**2. Una sola regex por status code.**
+El primer intento de solución fue agregar otra integration response para el 400, pero API Gateway solo admite **una** por status code. Habría sido necesario combinar patrones (`A|B`) y agregar lógica condicional en VTL, dependiendo además del texto exacto de un mensaje interno de AWS. Se descartó esa opción en favor del validador de modelos, que frena el request **antes** de invocar Lambda: la latencia bajó a **4 ms** y en los logs ya no aparece la llamada a Lambda.
+
+**3. Un método sin mapeo de errores filtra detalles internos.**
+Mientras `GET /orders` no tenía integration responses de error, `GET /orders` sin `customerId` respondió **200 OK** con el error crudo de Lambda, incluyendo el `stackTrace` con nombres de clases y números de línea:
+```json
+{"errorMessage":"INVALID_REQUEST: customerId is required","errorType":"com.workshop.orders.lambda.OperationFailedException","stackTrace":["com.workshop.orders.lambda.LambdaErrors.translate(LambdaErrors.java:17)", ...]}
+```
+El código Java era correcto. El problema era **configuración faltante** en un método, y nada en la configuración lo advertía.
+
+**4. Errores de tipeo sin red de seguridad.**
+En una plantilla de error se escribió `"INTERNAL_REQUEST"` en lugar de `"INTERNAL_ERROR"`. En Java, un test lo habría detectado. En una mapping template, nada lo detecta hasta que ocurre un error 500 en producción.
+
+**5. Lo que se crea en una Lambda no existe en las demás.**
+`POST /orders` respondió **201** con `Location: /orders/ORD-004`, pero `GET /orders/ORD-004` respondió **404**. De igual forma, `CUST-100` aparece vacío aunque se le creó una orden en la Parte II. Cada Lambda (`orders-create`, `orders-get`, `orders-search`) tiene su propio entorno de ejecución y su propia copia del repositorio en memoria. Con una base de datos compartida (por ejemplo DynamoDB) bastaría con otra implementación de `OrderRepository`, sin modificar `OrderService`.
+
+### Checkpoint 3 — Responsabilidades de API Gateway
+
+En esta arquitectura, API Gateway es responsable de:
+
+| Responsabilidad | Cómo se implementó |
+|---|---|
+| **Enrutamiento** | Recursos `/orders` y `/orders/{id}` con un método por operación, cada uno conectado a una Lambda distinta |
+| **Extracción de path parameters** | `$input.params('id')` en la mapping template |
+| **Extracción de query parameters** | `$input.params('customerId')` en la mapping template |
+| **Transformación de requests** | Mapping templates que construyen el JSON de entrada de cada función |
+| **Validación de formato** | Modelo JSON Schema + validador `Validate body` |
+| **Transformación de respuestas** | Plantilla del 201 que devuelve la orden; plantillas que convierten el error de Lambda al formato `{error, message}` |
+| **Elección de status codes** | 201 por defecto en POST; 404/400/500 por regex sobre `errorMessage` |
+| **Headers de respuesta** | `Location` construido en VTL con `$context.responseOverride` |
+| **Mapeo de errores** | Una regex por status code en cada método; Gateway response `Bad Request Body` para el validador |
+
+Lo único que queda en Java es la lógica de negocio y una traducción mínima de excepciones a prefijos.
+
+#### Ventajas
+
+- **El código Java queda muy limpio.** Las funciones reciben y devuelven objetos de dominio. No hay requests, headers ni status codes en Java.
+- **El contrato HTTP es visible en la configuración de la API.** Rutas, parámetros, modelos y status codes están declarados en API Gateway.
+- **Se puede rechazar tráfico inválido antes de invocar Lambda.** El validador respondió en 4 ms sin costo de invocación.
+- **Cada operación escala y se despliega de forma independiente**, y puede tener permisos, memoria y timeout propios.
+#### Desventajas
+
+- **La lógica HTTP está dispersa en muchos lugares de la consola**: templates de request, method responses, integration responses, regex, modelos y gateway responses, todo por método. Para tres operaciones ya fue necesario configurar decenas de piezas.
+- **Esa lógica no tiene tests.** Los errores de los hallazgos 1, 3 y 4 solo se descubrieron probando manualmente. Las mismas reglas en Java habrían quedado cubiertas por pruebas unitarias.
+- **El comportamiento por defecto es peligroso.** Si falta una regex, un error se convierte en 200 o 201 y puede filtrar el stack trace (hallazgos 1 y 3).
+- **El mapeo de errores depende de texto.** El status code depende de que el `errorMessage` empiece con un prefijo exacto. Es un acoplamiento implícito entre el código Java y la configuración de API Gateway, sin ningún compilador que lo verifique.
+- **VTL es un lenguaje limitado y difícil de depurar.** Construir algo tan simple como `/orders/{id}` requirió `$context.responseOverride`, porque los header mappings no permiten concatenar.
+- **La configuración no está versionada.** Vive en la consola de AWS, no en el repositorio. Este README la documenta manualmente, pero nada garantiza que coincida con lo desplegado. Una herramienta de infraestructura como código (SAM, CloudFormation, CDK) mitigaría este problema.
+- **Cambiar la configuración exige redesplegar el stage.** En varias ocasiones la consola mostraba un comportamiento y `curl` otro, porque faltaba el deploy.
+  **Conclusión del checkpoint:** esta distribución mantiene el Java muy limpio, pero a costa de mover lógica real (decisiones de status code, construcción de headers y formato de errores) a un lugar sin tests, sin versionamiento y con valores por defecto inseguros. Para una API pequeña y estable puede ser aceptable. A medida que crece el número de operaciones, el costo de configurar y verificar manualmente cada método crece con ella.
 
 ## 5. Parte V — Lambda proxy integration
 
@@ -361,4 +658,3 @@ _Pendiente._
 mvn test      # ejecuta las pruebas unitarias
 mvn package   # genera target/orders-api-1.0.0.jar
 ```
- 
