@@ -54,4 +54,13 @@ public class OrderService {
     private static boolean isBlank(String s) {
         return s == null || s.isBlank();
     }
+
+    public void deleteOrder(String id) {
+        if (isBlank(id)) {
+            throw new InvalidOrderException("Order id is required");
+        }
+        if (!repository.deleteById(id)) {
+            throw new OrderNotFoundException(id);
+        }
+    }
 }

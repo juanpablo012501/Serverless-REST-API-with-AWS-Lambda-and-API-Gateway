@@ -52,6 +52,14 @@ class OrdersHttpHandlerTest {
         return handler.handleRequest(event, null);
     }
 
+    private static APIGatewayProxyRequestEvent deleteById(String id) {
+        return new APIGatewayProxyRequestEvent()
+                .withHttpMethod("DELETE")
+                .withResource("/orders/{id}")
+                .withPath("/orders/" + id)
+                .withPathParameters(Map.of("id", id));
+    }
+
     // ---------- GET /orders/{id} ----------
 
     @Test
@@ -156,5 +164,35 @@ class OrdersHttpHandlerTest {
         assertEquals(500, response.getStatusCode());
         assertEquals("{\"error\":\"INTERNAL_ERROR\",\"message\":\"Unexpected error\"}", response.getBody());
         assertFalse(response.getBody().contains("database"));
+    }
+
+    // ----------- Casos delete ---------
+    // ---------- DELETE /orders/{id} ----------
+
+    @Test
+    void deleteExistingOrderReturns204WithoutBody() {
+        APIGatewayProxyResponseEvent response = call(deleteById("ORD-001"));
+        assertEquals(204, response.getStatusCode());
+        assertNull(response.getBody());
+    }
+
+    @Test
+    void deleteMissingOrderReturns404WithErrorFormat() {
+        APIGatewayProxyResponseEvent response = call(deleteById("ORD-999"));
+        assertEquals(404, response.getStatusCode());
+        assertEquals("{\"error\":\"ORDER_NOT_FOUND\",\"message\":\"Order ORD-999 does not exist\"}",
+                response.getBody());
+    }
+
+    @Test
+    void deletingTwiceReturns204ThenOrder404() {
+        assertEquals(204, call(deleteById("ORD-001")).getStatusCode());
+        assertEquals(404, call(deleteById("ORD-001")).getStatusCode());
+    }
+
+    @Test
+    void getAfterDeleteReturns404() {
+        call(deleteById("ORD-001"));
+        assertEquals(404, call(getById("ORD-001")).getStatusCode());
     }
 }

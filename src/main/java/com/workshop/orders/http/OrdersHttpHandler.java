@@ -73,6 +73,7 @@ public class OrdersHttpHandler
         }
         if ("/orders/{id}".equals(resource)) {
             if ("GET".equals(method))  return getOrder(event);
+            if ("DELETE".equals(method)) return deleteOrder(event);
         }
         return error(405, "METHOD_NOT_ALLOWED", method + " " + resource + " is not supported");
     }
@@ -101,6 +102,14 @@ public class OrdersHttpHandler
         String customerId = param(event.getQueryStringParameters(), "customerId");
         List<Order> orders = service.getOrdersByCustomer(customerId);
         return json(200, orders);
+    }
+
+    private APIGatewayProxyResponseEvent deleteOrder(APIGatewayProxyRequestEvent event) {
+        String id = param(event.getPathParameters(), "id");
+        service.deleteOrder(id);
+        return new APIGatewayProxyResponseEvent()
+                .withStatusCode(204)
+                .withHeaders(new HashMap<>());
     }
 
     // ---------- Utilidades HTTP ----------

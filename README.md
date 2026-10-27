@@ -973,11 +973,208 @@ El punto 3 habría anticipado el hallazgo 1 (errores sin regex que se convierten
 
 ## 8. Extensión: DELETE /orders/{id}
 
-_Pendiente._
+### Contrato
+
+| Request | Respuesta |
+|---|---|
+| `DELETE /orders/{id}` (existe) | `204 No Content`, sin body |
+| `DELETE /orders/{id}` (no existe) | `404 Not Found` con `{"error":"ORDER_NOT_FOUND","message":"Order {id} does not exist"}` |
+
+### Predicción
+
+Antes de implementar el cambio se escribió y subió al repositorio la predicción en [`PREDICTION.md`](PREDICTION.md). En resumen:
+
+- Implementarlo solo en la **Arquitectura B**.
+- **Sin Lambda nueva** y **sin cambios en API Gateway**, gracias a `ANY /orders/{id}`.
+- Cambiar 4 clases: `OrderRepository`, `InMemoryOrderRepository`, `OrderService` y `OrdersHttpHandler`.
+- `OrderService` **sabe** que la orden no existe; `OrdersHttpHandler` lo **traduce** a 404.
+- Tests en `OrderServiceTest` y `OrdersHttpHandlerTest`.
+### Implementación
+
+| Clase | Cambio | Líneas aprox. |
+|---|---|---|
+| `OrderRepository` | `boolean deleteById(String id)` | 1 |
+| `InMemoryOrderRepository` | `return orders.remove(id) != null;` | 4 |
+| `OrderService` | `deleteOrder(id)`: valida el id y lanza `OrderNotFoundException` si el repositorio no borró nada | 8 |
+| `OrdersHttpHandler` | Nueva rama en `route()` + método `deleteOrder()` que responde 204 | 8 |
+
+```java
+// OrderService
+public void deleteOrder(String id) {
+    if (isBlank(id)) {
+        throw new InvalidOrderException("Order id is required");
+    }
+    if (!repository.deleteById(id)) {
+        throw new OrderNotFoundException(id);
+    }
+}
+ 
+// OrdersHttpHandler.route()
+if ("/orders/{id}".equals(resource)) {
+    if ("GET".equals(method))    return getOrder(event);
+    if ("DELETE".equals(method)) return deleteOrder(event);
+}
+ 
+// OrdersHttpHandler
+private APIGatewayProxyResponseEvent deleteOrder(APIGatewayProxyRequestEvent event) {
+    String id = param(event.getPathParameters(), "id");
+    service.deleteOrder(id);
+    return new APIGatewayProxyResponseEvent()
+            .withStatusCode(204)
+            .withHeaders(new HashMap<>());
+}
+```
+
+**No se escribió ningún código para el 404:** el `catch (OrderNotFoundException e)` que ya existía para `GET /orders/{id}` lo resolvió.
+
+**Despliegue:** solo se subió el JAR nuevo a la Lambda `orders-http`. **No se modificó ni se volvió a desplegar API Gateway.**
+
+### Tests agregados
+
+| Clase | Test |
+|---|---|
+| `OrderServiceTest` | `deletesExistingOrder`: después de borrar, `getOrder` lanza `OrderNotFoundException` |
+| `OrderServiceTest` | `deletingMissingOrderThrowsNotFound` |
+| `OrderServiceTest` | `deletingWithBlankIdIsInvalid` |
+| `OrdersHttpHandlerTest` | `deleteExistingOrderReturns204WithoutBody` |
+| `OrdersHttpHandlerTest` | `deleteMissingOrderReturns404WithErrorFormat` |
+| `OrdersHttpHandlerTest` | `deletingTwiceReturns204ThenOrder404` |
+| `OrdersHttpHandlerTest` | `getAfterDeleteReturns404` |
+
+Total del proyecto: **34 tests, 0 fallos**. El test `unsupportedMethodReturns405` (que usa `PUT`) siguió pasando sin cambios.
+
+### Pruebas con curl
+
+| Request | Status | Body |
+|---|---|---|
+| `DELETE /orders/ORD-001` | **204 No Content** | _(vacío, `Content-Length: 0`)_ |
+| `DELETE /orders/ORD-001` (otra vez) | **404 Not Found** | `{"error":"ORDER_NOT_FOUND","message":"Order ORD-001 does not exist"}` |
+| `GET /orders/ORD-001` (después de borrarla) | **404 Not Found** | `{"error":"ORDER_NOT_FOUND","message":"Order ORD-001 does not exist"}` |
+| `DELETE /orders/ORD-999` | **404 Not Found** | `{"error":"ORDER_NOT_FOUND","message":"Order ORD-999 does not exist"}` |
+
+```powershell
+curl.exe -i -X DELETE "$API2/orders/ORD-001"
+curl.exe -i -X DELETE "$API2/orders/ORD-001"
+curl.exe -i "$API2/orders/ORD-001"
+curl.exe -i -X DELETE "$API2/orders/ORD-999"
+```
+
+### Predicción vs. propuesta del agente vs. resultado
+
+| Pregunta | Predicción | Propuesta del agente | Resultado real |
+|---|---|---|---|
+| ¿Qué clases cambian? | Repositorio (interfaz e implementación), servicio y adaptador | Las mismas 4 | ✅ Las mismas 4 |
+| ¿Lambda nueva? | No | No | ✅ No: se reutilizó `orders-http` |
+| ¿Cambia API Gateway? | No | No | ✅ No se tocó ni se redesplegó |
+| Lógica de eliminación | `OrderService` + repositorio | Igual | ✅ Igual |
+| Decisión 204 / 404 | Servicio detecta, adaptador traduce | Igual | ✅ El 404 salió del `catch` existente |
+| Tests | Servicio y adaptador, incluido borrar dos veces | Igual | ✅ 7 tests nuevos |
+| El 204 sin `Content-Type` | Riesgo: asegurarse de no enviarlo | El adaptador no lo envía | ⚠️ **API Gateway lo agregó** (ver abajo) |
+
+**Diferencia encontrada: `Content-Type` en el 204.** El adaptador devuelve el 204 sin headers, pero la respuesta real incluye `Content-Type: application/json`. Es API Gateway quien lo agrega por defecto en las respuestas proxy. No rompe nada, porque el body está vacío (`Content-Length: 0`), pero demuestra que, incluso en modo proxy, API Gateway sigue haciendo pequeñas transformaciones que no se ven desde Java y que **los tests unitarios no pueden detectar**. Solo se descubrió probando contra el despliegue real.
+
+**Sobre cómo se construyó la predicción:** una primera versión, escrita sin ayuda, proponía crear una Lambda nueva y sin cambios en API Gateway, lo cual era contradictorio, y ubicaba la lógica de forma imprecisa ("en el modelo", "en la Lambda"). Esa primera versión se revisó con el asistente antes de subirla. La contradicción entre "Lambda nueva" y "sin cambios en API Gateway" fue la pista clave: en la Arquitectura B, la Lambda única con `ANY` hace innecesario tocar API Gateway.
+
+### Comparación con la Arquitectura A
+
+En la Arquitectura A, el mismo cambio habría requerido:
+1. Una Lambda nueva (`orders-delete`) con su propia clase de entrada.
+2. Un método `DELETE` en `/orders/{id}` con su mapping template de request.
+3. Method responses para 204, 404, 400 y 500.
+4. Integration responses: la de por defecto cambiada a 204 y sin body, más tres con regex y plantilla de error.
+5. Volver a desplegar el stage.
+   Todo eso sin tests y con los mismos riesgos de los hallazgos 1, 3 y 4. En la Arquitectura B fueron unas 20 líneas de Java, 7 tests y subir un JAR.
+
+### Comportamiento ante un error interno inesperado
+
+El enunciado pide determinar qué hace el sistema ante un error inesperado. En la API final (Arquitectura B), cualquier excepción que no sea de dominio ni de parseo cae en el `catch (Exception e)` de `OrdersHttpHandler`:
+
+1. Se registra el detalle en CloudWatch con `context.getLogger().log(...)`, para poder diagnosticarlo.
+2. Se responde **500 Internal Server Error** con un mensaje genérico:
+```json
+   {"error":"INTERNAL_ERROR","message":"Unexpected error"}
+```
+3. **No se exponen** el mensaje interno, el stack trace ni nombres de clases.
+   Esto está verificado por el test `unexpectedErrorReturns500WithoutInternalDetails`, que simula un repositorio que falla con `"database connection lost"` y comprueba que ese texto no aparece en la respuesta.
+
+Si la falla ocurre **fuera** del handler (por ejemplo, un timeout de Lambda o un error al iniciar la función), API Gateway responde por su cuenta con **502 Bad Gateway** o **504 Gateway Timeout** y su propio formato de error, que no sigue nuestro contrato. Para unificarlo se podrían personalizar las gateway responses `DEFAULT_5XX` de la API.
+ 
+---
 
 ## 9. Arquitectura final
 
-_Pendiente._
+La API final se implementa con la **Arquitectura B (Lambda proxy integration)**.
+
+```mermaid
+flowchart LR
+    C["Cliente HTTP<br/>(curl, Postman)"]
+ 
+    subgraph AWS["☁️ AWS"]
+        direction LR
+        GW["API Gateway<br/>orders-api-proxy<br/>ANY /orders<br/>ANY /orders/{id}"]
+ 
+        subgraph LAMBDA["Lambda orders-http (Java 17)"]
+            direction LR
+            H["OrdersHttpHandler<br/>🔶 depende de AWS<br/>(aws-lambda-java-core/events)<br/>+ Jackson"]
+ 
+            subgraph JAVA["🟩 Java puro (sin AWS ni HTTP)"]
+                direction TB
+                S["OrderService"]
+                R["OrderRepository<br/>InMemoryOrderRepository"]
+                D["Order · CreateOrderRequest<br/>OrderNotFoundException<br/>InvalidOrderException"]
+                S --> R
+                S --> D
+            end
+ 
+            H -->|"CreateOrderRequest / id / customerId"| S
+            S -->|"Order / List&lt;Order&gt; / excepción de dominio"| H
+        end
+ 
+        GW -->|"APIGatewayProxyRequestEvent"| H
+        H -->|"APIGatewayProxyResponseEvent<br/>(status, headers, body)"| GW
+    end
+ 
+    C -->|"HTTP request"| GW
+    GW -->|"HTTP response"| C
+```
+
+### Componentes
+
+| Componente | Tipo | Depende de AWS | Responsabilidad |
+|---|---|---|---|
+| Cliente | Externo | — | Envía requests HTTP |
+| API Gateway (`orders-api-proxy`) | Servicio AWS | Sí | Exponer el endpoint HTTPS y entregar el request completo a Lambda (proxy) |
+| Lambda `orders-http` | Servicio AWS | Sí | Ejecutar el código Java bajo demanda |
+| `OrdersHttpHandler` | Adaptador HTTP | **Sí** (`aws-lambda-java-core`, `aws-lambda-java-events`) | Enrutar, extraer parámetros, (de)serializar JSON, elegir status codes y headers, mapear errores |
+| `ErrorResponse` | DTO HTTP | No | Formato del error del contrato |
+| `OrderService` | Lógica de aplicación | **No** | Reglas de negocio: validar, crear, consultar, buscar y eliminar |
+| `OrderRepository` / `InMemoryOrderRepository` | Almacenamiento | **No** | Guardar y recuperar órdenes |
+| `Order`, `CreateOrderRequest`, excepciones | Dominio | **No** | Conceptos del negocio |
+
+### Dirección de las dependencias
+
+Las dependencias apuntan **hacia adentro**: `OrdersHttpHandler` depende de `OrderService`, pero `OrderService` no sabe que existe un adaptador HTTP ni AWS. Por eso:
+
+- La lógica de negocio se prueba sin AWS (`OrderServiceTest`).
+- El adaptador también se prueba sin AWS, construyendo eventos a mano (`OrdersHttpHandlerTest`).
+- Se podría reemplazar Lambda por otro mecanismo de entrada (un servidor HTTP, una cola de mensajes) escribiendo otro adaptador, sin tocar `OrderService`.
+- Se podría reemplazar el repositorio en memoria por uno persistente (por ejemplo DynamoDB) implementando `OrderRepository`, sin tocar `OrderService` ni el adaptador.
+### API final
+
+```
+POST    /orders                          → 201 Created + Location | 400
+GET     /orders/{id}                     → 200 OK | 404
+GET     /orders?customerId={customerId}  → 200 OK | 400
+DELETE  /orders/{id}                     → 204 No Content | 404
+(otros métodos)                          → 405 Method Not Allowed
+(error inesperado)                       → 500 Internal Server Error
+```
+
+Invoke URL: `https://plj90flkd8.execute-api.us-east-1.amazonaws.com/dev`
+
+> La URL depende del laboratorio de AWS Academy y puede dejar de funcionar cuando el laboratorio termine.
+ 
+---
 
 ## 10. Cómo compilar y probar
 
@@ -985,9 +1182,58 @@ _Pendiente._
 
 - JDK 17 o superior (el proyecto compila con `release 17`)
 - Maven 3.9+
-### Comandos
+- `curl` (en PowerShell usar `curl.exe`)
+### Compilar y ejecutar las pruebas
 
 ```bash
-mvn test      # ejecuta las pruebas unitarias
-mvn package   # genera target/orders-api-1.0.0.jar
+mvn clean test      # ejecuta los 34 tests unitarios, sin AWS
+mvn clean package   # ejecuta los tests y genera target/orders-api-1.0.0.jar (fat jar)
+```
+
+`mvn package` genera dos JAR:
+- `target/orders-api-1.0.0.jar`: **el que se sube a Lambda** (incluye AWS events y Jackson).
+- `target/original-orders-api-1.0.0.jar`: solo las clases del proyecto.
+### Estructura del proyecto
+
+```
+orders-api/
+├── pom.xml
+├── README.md
+├── PREDICTION.md
+├── events/                       # eventos reales de API Gateway (proxy)
+├── requests/                     # bodies de ejemplo para los POST
+├── imgs/                         # evidencias
+└── src/
+    ├── main/java/com/workshop/orders/
+    │   ├── domain/               # Java puro: Order, CreateOrderRequest, excepciones
+    │   ├── application/          # Java puro: OrderService, repositorios
+    │   ├── lambda/               # Arquitectura A: clases de entrada no-proxy
+    │   └── http/                 # Arquitectura B: OrdersHttpHandler (adaptador HTTP)
+    └── test/java/com/workshop/orders/
+        ├── application/          # OrderServiceTest
+        ├── lambda/               # LambdaFunctionsTest
+        └── http/                 # OrdersHttpHandlerTest
+```
+
+### Desplegar la API final (Arquitectura B)
+
+1. `mvn clean package`
+2. **Lambda** → crear `orders-http` (Java 17, rol `LabRole`, timeout 15 s).
+3. Subir `target/orders-api-1.0.0.jar`.
+4. Handler: `com.workshop.orders.http.OrdersHttpHandler::handleRequest`
+5. **API Gateway** → REST API `orders-api-proxy` → recursos `/orders` y `/orders/{id}` → método `ANY` en cada uno con **Lambda proxy integration** hacia `orders-http`.
+6. **Deploy API** → stage `dev`.
+   La configuración de la Arquitectura A se documenta en la [sección 4](#4-parte-iii-y-iv--api-gateway-con-mapping-templates).
+
+### Probar la API desplegada
+
+```powershell
+$API = "https://<api-id>.execute-api.us-east-1.amazonaws.com/dev"
+ 
+curl.exe -i -X POST "$API/orders" -H "Content-Type: application/json" --data-binary "@requests/create-order.json"
+curl.exe -i "$API/orders/ORD-001"
+curl.exe -i "$API/orders?customerId=CUST-42"
+curl.exe -i -X DELETE "$API/orders/ORD-001"
+curl.exe -i "$API/orders/ORD-999"
+curl.exe -i -X POST "$API/orders" -H "Content-Type: application/json" --data-binary "@requests/create-order-invalid-quantity.json"
 ```

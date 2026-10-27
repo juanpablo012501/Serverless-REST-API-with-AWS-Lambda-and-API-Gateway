@@ -86,4 +86,23 @@ class OrderServiceTest {
     void rejectsBlankCustomerIdInSearch() {
         assertThrows(InvalidOrderException.class, () -> service.getOrdersByCustomer(""));
     }
+
+    @Test
+    void deletesExistingOrder() {
+        Order created = service.createOrder(new CreateOrderRequest("CUST-42", "Mouse", 1));
+
+        service.deleteOrder(created.getId());
+
+        assertThrows(OrderNotFoundException.class, () -> service.getOrder(created.getId()));
+    }
+
+    @Test
+    void deletingMissingOrderThrowsNotFound() {
+        assertThrows(OrderNotFoundException.class, () -> service.deleteOrder("ORD-999"));
+    }
+
+    @Test
+    void deletingWithBlankIdIsInvalid() {
+        assertThrows(InvalidOrderException.class, () -> service.deleteOrder(" "));
+    }
 }
